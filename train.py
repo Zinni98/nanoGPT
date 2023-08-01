@@ -149,7 +149,12 @@ if init_from == 'scratch':
         print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
     model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
     gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
+    try:
+        emb_mat = torch.load(os.path.join(data_dir, 'emb_mat.pt'))
+        model = GPT(gptconf, emb_mat)
+    except FileNotFoundError:
+        print("Cannot use pre-trained Embeddings")
+        model = GPT(gptconf)
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
@@ -329,3 +334,7 @@ while True:
 
 if ddp:
     destroy_process_group()
+
+# step 5000: train loss 0.8321, val loss 1.5370
+# step 5000: train loss 1.1316, val loss 1.4613  with glove 200-6b 4 att heads
+# step 5000: train loss 1.1284, val loss 1.4602  with glove 200-twitter.27b 4 att heads
