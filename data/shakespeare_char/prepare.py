@@ -13,7 +13,7 @@ from torchtext.vocab import GloVe
 
 emb_dim = 200
 embedding_path = "/home/alessandro.zinni/emb_cache"
-global_vectors = GloVe(name='twitter.27B', dim=emb_dim, cache = embedding_path)
+global_vectors = GloVe(name='twitter.27B', dim=emb_dim, cache=embedding_path)
 def get_embedding_matrix(embedding, embedding_dim, vocab):
     """
     Create an embedding matrix from a given embedding dictionary.
