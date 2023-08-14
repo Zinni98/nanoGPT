@@ -13,6 +13,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
+from flash_attn.flash_attn_triton import flash_attn_func
 from torch.nn import functional as F
 
 class LayerNorm(nn.Module):
@@ -41,8 +42,33 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
+        self.alibi = config.alibi
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        if self.alibi:
+            self.flash = False
+            def get_slopes(n):
+                def get_slopes_power_of_2(n):
+                    start = (2**(-2**-(math.log2(n)-3)))
+                    ratio = start
+                    return [start*ratio**i for i in range(n)]
+
+                if math.log2(n).is_integer():
+                    return get_slopes_power_of_2(n)
+                else:
+                    closest_power_of_2 = 2**math.floor(math.log2(n))
+                    return get_slopes_power_of_2(closest_power_of_2) + get_slopes(2*closest_power_of_2)[0::2][:n-closest_power_of_2]
+            slopes = torch.Tensor(get_slopes(self.n_head))
+            #In the next line, the part after the * is what constructs the diagonal matrix (right matrix in Figure 3 in the paper). 
+            #If you run it you'll see that it doesn't exactly print out the same matrix as we have in Figure 3, but one where all rows are identical.
+            #This works because the softmax operation is invariant to translation, and our bias functions are always linear. 
+            alibi = slopes.unsqueeze(1).unsqueeze(1) * torch.arange(config.block_size).unsqueeze(0).unsqueeze(0).expand(self.n_head, -1, -1)
+            alibi = alibi.view(self.n_head, 1, config.block_size)
+            # batch_size*n_heads x 1 x seq_len
+            self.alibi = alibi.repeat(config.batch_size, 1, 1)
+            self.future_mask = torch.empty(0)
+            print("WARNING: using slow attention. Disable ALiBi for fast attention")
+        else:
+            self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
             # causal mask to ensure that attention is only applied to the left in the input sequence
@@ -65,6 +91,8 @@ class CausalSelfAttention(nn.Module):
         else:
             # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            if self.alibi:
+                pass
             att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
@@ -93,8 +121,9 @@ class MLP(nn.Module):
 
 class Block(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, log):
         super().__init__()
+        self.log = log
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
@@ -107,6 +136,7 @@ class Block(nn.Module):
 
 @dataclass
 class GPTConfig:
+    batch_size: int
     block_size: int = 1024
     vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer: int = 12
@@ -114,25 +144,36 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    alibi: bool = True
 
 class GPT(nn.Module):
 
-    def __init__(self, config, embedding_matrix=None):
+    def __init__(self, config, embedding_matrix=None, log=True):
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
+        self.log = log
         if embedding_matrix != None: 
             wte = self.create_embedding_layer(embedding_matrix)
         else:
             wte = nn.Embedding(config.vocab_size, config.n_embd)
-        self.transformer = nn.ModuleDict(dict(
-            wte = wte,
-            wpe = nn.Embedding(config.block_size, config.n_embd),
-            drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = LayerNorm(config.n_embd, bias=config.bias),
-        ))
+        wpe = False if config.alibi else nn.Embedding(config.block_size, config.n_embd)
+        if wpe:
+            self.transformer = nn.ModuleDict(dict(
+                wte = wte,
+                wpe = wpe,
+                drop = nn.Dropout(config.dropout),
+                h = nn.ModuleList([Block(config, log) for _ in range(config.n_layer)]),
+                ln_f = LayerNorm(config.n_embd, bias=config.bias),
+            ))
+        else:
+            self.transformer = nn.ModuleDict(dict(
+                wte = wte,
+                drop = nn.Dropout(config.dropout),
+                h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+                ln_f = LayerNorm(config.n_embd, bias=config.bias),
+            ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
@@ -189,7 +230,9 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self,
+                idx,
+                targets=None):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
