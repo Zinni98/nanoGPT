@@ -26,7 +26,7 @@ import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
-
+from usage_logger import UsageLogger, Measures
 from model import GPTConfig, GPT
 
 # -----------------------------------------------------------------------------
@@ -43,6 +43,8 @@ init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 wandb_log = False # disabled by default
 wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
+log=True
+save_dir_logger = f"./logs/{wandb_run_name}"
 # data
 dataset = 'openwebtext'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
@@ -54,6 +56,7 @@ n_head = 12
 n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
+alibi = False
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -77,7 +80,7 @@ config_keys = [k for k,v in globals().items() if not k.startswith('_') and isins
 exec(open('configurator.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
-
+save_dir_logger = os.path.join(os.path.dirname(__file__), save_dir_logger)
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
 if ddp:
@@ -142,7 +145,7 @@ if os.path.exists(meta_path):
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+                  bias=bias, vocab_size=None, dropout=dropout, alibi=alibi, batch_size=batch_size) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -153,10 +156,10 @@ if init_from == 'scratch':
     gptconf = GPTConfig(**model_args)
     try:
         emb_mat = torch.load(os.path.join(data_dir, 'emb_mat.pt'))
-        model = GPT(gptconf, emb_mat)
+        model = GPT(gptconf, embedding_matrix=emb_mat, log=log)
     except FileNotFoundError:
         print("Cannot use pre-trained Embeddings")
-        model = GPT(gptconf)
+        model = GPT(gptconf, log=log)
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
@@ -165,11 +168,11 @@ elif init_from == 'resume':
     checkpoint_model_args = checkpoint['model_args']
     # force these config attributes to be equal otherwise we can't even resume training
     # the rest of the attributes (e.g. dropout) can stay  as desired from command line
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
+    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size', 'alibi', 'batch_size']:
         model_args[k] = checkpoint_model_args[k]
     # create the model
     gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
+    model = GPT(gptconf, log=log)
     state_dict = checkpoint['model']
     # fix the keys of the state dictionary :(
     # honestly no idea how checkpoints sometimes get this prefix, have to debug more
@@ -186,7 +189,7 @@ elif init_from.startswith('gpt2'):
     override_args = dict(dropout=dropout)
     model = GPT.from_pretrained(init_from, override_args)
     # read off the created config params, so we can store them into checkpoint correctly
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
+    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size', 'alibi', 'batch_size']:
         model_args[k] = getattr(model.config, k)
 # crop down the model block size if desired, using model surgery
 if block_size < model.config.block_size:
@@ -214,6 +217,10 @@ if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
+if log and master_process:
+    eval_logger = UsageLogger(Measures.EVALUATION, save_path=save_dir_logger)
+    train_logger = UsageLogger(Measures.TRAIN, save_path=save_dir_logger)
+    total_logger = UsageLogger(Measures.DEFAULT, save_path=save_dir_logger)
 @torch.no_grad()
 def estimate_loss():
     out = {}
@@ -254,6 +261,11 @@ t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
+
+if log and master_process:
+    start = time.time()
+if log and master_process:
+    total_logger.start()
 while True:
 
     # determine and set the learning rate for this iteration
@@ -263,7 +275,11 @@ while True:
 
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
+        if log:
+            eval_logger.start(iter_num)
         losses = estimate_loss()
+        if log:
+            eval_logger.stop()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         if wandb_log:
             wandb.log({
@@ -289,6 +305,8 @@ while True:
     if iter_num == 0 and eval_only:
         break
 
+    if log and master_process:
+        train_logger.start(iter_num)
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     # and using the GradScaler if data type is float16
     for micro_step in range(gradient_accumulation_steps):
@@ -310,10 +328,13 @@ while True:
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
     # step the optimizer and scaler if training in fp16
+
     scaler.step(optimizer)
     scaler.update()
     # flush the gradients as soon as we can, no need for this memory anymore
     optimizer.zero_grad(set_to_none=True)
+    if log and master_process:
+        train_logger.stop()
     # timing and logging
     t1 = time.time()
     dt = t1 - t0
@@ -333,9 +354,26 @@ while True:
     if iter_num > max_iters:
         break
 
+total_logger.stop()
 if ddp:
     destroy_process_group()
+
+if log and master_process:
+    finish = time.time()
+    total_logger.export()
+    train_logger.export()
+    eval_logger.export()
+    total_training_time = finish-start
+    print(f"Total training time {total_training_time}")
+
 
 # step 5000: train loss 0.8321, val loss 1.5370
 # step 5000: train loss 1.1316, val loss 1.4613  with glove 200-6b 4 att heads
 # step 5000: train loss 1.1284, val loss 1.4602  with glove 200-twitter.27b 4 att heads
+
+
+# Training times:
+# standard_flash_attn: 120.90297961235046s
+# no_flash: 124.81698536872864
+# triton_flash_attn:
+# triton + alibi: 
