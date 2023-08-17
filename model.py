@@ -158,8 +158,9 @@ class GPT(nn.Module):
             wte = self.create_embedding_layer(embedding_matrix)
         else:
             wte = nn.Embedding(config.vocab_size, config.n_embd)
-        wpe = False if config.alibi else nn.Embedding(config.block_size, config.n_embd)
+        wpe = False if config.alibi else True
         if wpe:
+            wpe = nn.Embedding(config.block_size, config.n_embd)
             self.transformer = nn.ModuleDict(dict(
                 wte = wte,
                 wpe = wpe,
