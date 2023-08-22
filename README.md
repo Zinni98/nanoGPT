@@ -40,9 +40,7 @@ Before training:
 Before training:
 
 - Go to `config/train_gpt2.py`, got to the end of the file and set `alibi=True`.
-- Set `block_size=512` also in `config/train_gpt2.py`.
-
-This means that when using alibi, the network is trained with block size of 512 and evaluated with block size of 1024. <br>
+- Set `block_size=512` also in `config/train_gpt2.py` (This means that when using alibi, the network is trained with block size of 512 and evaluated with block size of 1024).
 
 *Note that Alibi doesn't work with flash attention, hence even if flash attention is set to True, it will not be used*
 
