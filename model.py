@@ -55,7 +55,6 @@ class CausalSelfAttention(nn.Module):
             print("WARNING: using slow attention. Disable ALiBi for fast attention")
         else:
             self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
-            self.flash = False
         if not self.flash:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
             # causal mask to ensure that attention is only applied to the left in the input sequence
@@ -120,8 +119,9 @@ class CausalSelfAttention(nn.Module):
                 att = att.masked_fill(bias[:,:,:T,:T] == 0, float('-inf')) + alibi_matrix
                 # print(att.shape)
             else:
+                bias = self.get_buffer(f"bias_{T}")
                 att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-                att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+                att = att.masked_fill(bias[:,:,:T,:T] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
