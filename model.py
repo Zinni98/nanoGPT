@@ -33,6 +33,7 @@ class AlibiAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
+        print("Using Alibi")
         if config.flash_attn:
             print("WARNING: using slow attention. Disable ALiBi for fast attention")
         # key, query, value projections for all heads, but in a batch
@@ -209,7 +210,7 @@ class GPTConfig:
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     alibi: bool = True
     eval_block_size: int = 1024
-    flash_attn: int = True
+    flash_attn: bool = True
 
 class GPT(nn.Module):
 

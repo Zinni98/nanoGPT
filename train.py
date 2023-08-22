@@ -155,7 +155,7 @@ if os.path.exists(meta_path):
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                   bias=bias, vocab_size=None, dropout=dropout, alibi=alibi, batch_size=batch_size, eval_block_size=eval_block_size,
-                  flash_attn=True) # start with model_args from command line
+                  flash_attn=flash_attn) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     if master_process:

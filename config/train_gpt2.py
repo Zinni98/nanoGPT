@@ -28,6 +28,6 @@ log_interval = 10
 weight_decay = 1e-1
 
 # Additional parameters
-flash_attn = False
+flash_attn = True
 alibi = False
 pre_trained_embs=False
