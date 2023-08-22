@@ -27,11 +27,14 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
-class CausalSelfAttention(nn.Module):
+
+class AlibiAttention(nn.Module):
 
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
+        if config.flash_attn:
+            print("WARNING: using slow attention. Disable ALiBi for fast attention")
         # key, query, value projections for all heads, but in a batch
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         # output projection
@@ -43,26 +46,15 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
-        self.alibi = config.alibi
-        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        if self.alibi:
-            self.flash = False
-            # Storing each alibi matrix into a dict to allow caching for different block sizes
-            
-            self.register_buffer(f"alibi_{config.block_size}", self._create_alibi_matrix(config.block_size, self.n_head))
-            if config.block_size != config.eval_block_size:
-                self.register_buffer(f"alibi_{config.eval_block_size}", self._create_alibi_matrix(config.eval_block_size, self.n_head))
-            print("WARNING: using slow attention. Disable ALiBi for fast attention")
-        else:
-            self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
-        if not self.flash:
-            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-            # causal mask to ensure that attention is only applied to the left in the input sequence
-            self.register_buffer(f"bias_{config.block_size}", torch.tril(torch.ones(config.block_size, config.block_size))
-                                                              .view(1, 1, config.block_size, config.block_size))
-            if config.block_size != config.eval_block_size:
-                self.register_buffer(f"bias_{config.eval_block_size}", torch.tril(torch.ones(config.eval_block_size, config.eval_block_size))
-                                                              .view(1, 1, config.eval_block_size, config.eval_block_size))
+        # String as buffer containing so it can be called depending on block size
+        self.register_buffer(f"alibi_{config.block_size}", self._create_alibi_matrix(config.block_size, self.n_head))
+        if config.block_size != config.eval_block_size:
+            self.register_buffer(f"alibi_{config.eval_block_size}", self._create_alibi_matrix(config.eval_block_size, self.n_head))
+        self.register_buffer(f"bias_{config.block_size}", torch.tril(torch.ones(config.block_size, config.block_size))
+                                                            .view(1, 1, config.block_size, config.block_size))
+        if config.block_size != config.eval_block_size:
+            self.register_buffer(f"bias_{config.eval_block_size}", torch.tril(torch.ones(config.eval_block_size, config.eval_block_size))
+                                                            .view(1, 1, config.eval_block_size, config.eval_block_size))
 
     def _create_alibi_matrix(self, seq_length, n_heads):
         matrix = torch.zeros(seq_length, seq_length)
@@ -103,25 +95,66 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
+        # Get correct size if training with block_size != eval_block_size
+        alibi_matrix = self.get_buffer(f"alibi_{T}")
+        bias = self.get_buffer(f"bias_{T}")
+        # Not Multiplying by (1.0 / math.sqrt(d_k)) see footnote 10 of alibi paper
+        # print(alibi_matrix.shape)
+        att = q @ k.transpose(-2, -1)
+        att = att.masked_fill(bias[:,:,:T,:T] == 0, float('-inf')) + alibi_matrix
+        # print(att.shape)
+        att = F.softmax(att, dim=-1)
+        att = self.attn_dropout(att)
+        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+
+        # output projection
+        y = self.resid_dropout(self.c_proj(y))
+        return y
+
+
+class CausalSelfAttention(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+        # key, query, value projections for all heads, but in a batch
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        # output projection
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        # regularization
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
+        self.batch_size = config.batch_size
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.dropout = config.dropout
+        if config.flash_attn:
+            self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        else:
+            self.flash = False
+        if not self.flash:
+            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0 and enable flash_attn flag in the configuration")
+            # causal mask to ensure that attention is only applied to the left in the input sequence
+            self.register_buffer(f"bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                                                              .view(1, 1, config.block_size, config.block_size))
+
+    def forward(self, x):
+        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
         else:
-            # manual implementation of attention
-            if self.alibi:
-                # Get correct size if training with block_size != eval_block_size
-                alibi_matrix = self.get_buffer(f"alibi_{T}")
-                bias = self.get_buffer(f"bias_{T}")
-                # Not Multiplying by (1.0 / math.sqrt(d_k)) see footnote 10 of alibi paper
-                # print(alibi_matrix.shape)
-                att = q @ k.transpose(-2, -1)
-                att = att.masked_fill(bias[:,:,:T,:T] == 0, float('-inf')) + alibi_matrix
-                # print(att.shape)
-            else:
-                bias = self.get_buffer(f"bias_{T}")
-                att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-                att = att.masked_fill(bias[:,:,:T,:T] == 0, float('-inf'))
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
@@ -152,7 +185,10 @@ class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config)
+        if config.alibi:
+            self.attn = AlibiAttention(config)
+        else:
+            self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
@@ -173,15 +209,15 @@ class GPTConfig:
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     alibi: bool = True
     eval_block_size: int = 1024
+    flash_attn: int = True
 
 class GPT(nn.Module):
 
-    def __init__(self, config, embedding_matrix=None, log=True):
+    def __init__(self, config, embedding_matrix=None):
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
-        self.log = log
         self.alibi = config.alibi
         if embedding_matrix != None: 
             wte = self.create_embedding_layer(embedding_matrix)

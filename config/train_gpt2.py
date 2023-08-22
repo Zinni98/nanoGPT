@@ -16,7 +16,6 @@ eval_block_size = 1024
 gradient_accumulation_steps = 5 * 8
 
 # this makes total number of tokens be 300B = 12 * 1024 * 5 * 8 * 600000
-alibi = False
 max_iters = 600000
 lr_decay_iters = 600000
 
@@ -27,3 +26,8 @@ log_interval = 10
 
 # weight decay
 weight_decay = 1e-1
+
+# Additional parameters
+flash_attn = False
+alibi = False
+pre_trained_embs=False

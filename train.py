@@ -58,6 +58,8 @@ n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 alibi = False
+flash_attn = True
+pre_trained_embs=False
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -152,7 +154,8 @@ if os.path.exists(meta_path):
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout, alibi=alibi, batch_size=batch_size, eval_block_size=eval_block_size) # start with model_args from command line
+                  bias=bias, vocab_size=None, dropout=dropout, alibi=alibi, batch_size=batch_size, eval_block_size=eval_block_size,
+                  flash_attn=True) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     if master_process:
@@ -163,13 +166,16 @@ if init_from == 'scratch':
             print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
     model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
     gptconf = GPTConfig(**model_args)
-    try:
-        emb_mat = torch.load(os.path.join(data_dir, 'emb_mat.pt'))
-        model = GPT(gptconf, embedding_matrix=emb_mat, log=log)
-    except FileNotFoundError:
-        if master_process:
-            print("Cannot use pre-trained Embeddings")
-        model = GPT(gptconf, log=log)
+    if pre_trained_embs:
+        try:
+            emb_mat = torch.load(os.path.join(data_dir, 'emb_mat.pt'))
+            model = GPT(gptconf, embedding_matrix=emb_mat)
+        except FileNotFoundError:
+            if master_process:
+                print("Cannot use pre-trained Embeddings")
+            model = GPT(gptconf)
+    else:
+        model = GPT(gptconf)
 elif init_from == 'resume':
     if master_process:
         print(f"Resuming training from {out_dir}")
@@ -179,11 +185,11 @@ elif init_from == 'resume':
     checkpoint_model_args = checkpoint['model_args']
     # force these config attributes to be equal otherwise we can't even resume training
     # the rest of the attributes (e.g. dropout) can stay  as desired from command line
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size', 'alibi', 'batch_size', "eval_block_size"]:
+    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size', 'alibi', 'batch_size', "eval_block_size", "flash_attn"]:
         model_args[k] = checkpoint_model_args[k]
     # create the model
     gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf, log=log)
+    model = GPT(gptconf)
     state_dict = checkpoint['model']
     # fix the keys of the state dictionary :(
     # honestly no idea how checkpoints sometimes get this prefix, have to debug more
@@ -201,7 +207,7 @@ elif init_from.startswith('gpt2'):
     override_args = dict(dropout=dropout)
     model = GPT.from_pretrained(init_from, override_args)
     # read off the created config params, so we can store them into checkpoint correctly
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size', 'alibi', 'batch_size', "eval_block_size"]:
+    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size', 'alibi', 'batch_size', "eval_block_size", "flash_attn"]:
         model_args[k] = getattr(model.config, k)
 # crop down the model block size if desired, using model surgery
 if block_size < model.config.block_size:
@@ -389,4 +395,4 @@ if log and master_process:
 # standard_flash_attn: 120.90297961235046s
 # no_flash: 124.81698536872864
 # triton_flash_attn:
-# triton + alibi: 
+# triton + alibi:
